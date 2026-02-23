@@ -113,12 +113,25 @@ def check_prediction_sanity(model_path: str) -> tuple[bool, str]:
     """
     Model shouldn't predict the same class for everything.
     A model that always predicts 0 or always 1 is broken.
+    Uses realistic feature ranges — not random noise.
     """
     model = joblib.load(model_path)
     np.random.seed(123)
 
-    # Diverse test samples
-    sample = np.random.rand(200, len(REQUIRED_FEATURES))
+    n = 200
+    # Generate samples using REALISTIC feature ranges
+    # matching the actual training data distribution
+    sample = np.column_stack([
+        np.random.randint(1, 72, n),          # tenure_months
+        np.random.uniform(20, 120, n),         # monthly_charges
+        np.random.uniform(100, 8000, n),       # total_charges
+        np.random.randint(1, 6, n),            # num_products
+        np.random.randint(0, 10, n),           # support_calls
+        np.random.randint(0, 30, n),           # payment_delay_days
+        np.random.choice([1, 12, 24], n),      # contract_length
+        np.random.randint(0, 2, n),            # has_online_backup
+        np.random.randint(0, 2, n),            # has_tech_support
+    ])
     predictions = model.predict(sample)
 
     unique_classes = len(set(predictions))
