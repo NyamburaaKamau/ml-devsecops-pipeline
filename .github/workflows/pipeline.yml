@@ -155,11 +155,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: tfsec — Terraform security scan
-        uses: aquasecurity/tfsec-action@v1.0.3
+      - name: Trivy — IaC security scan (replaces tfsec)
+        uses: aquasecurity/trivy-action@master
         with:
-          working_directory: platform/terraform
-          soft_fail: true
+          scan-type: config
+          scan-ref: platform/
+          exit-code: "0"
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-iac-results.sarif
+
+      - name: Upload Trivy IaC results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-iac-results.sarif') != ''
+        with:
+          sarif_file: trivy-iac-results.sarif
 
       - name: Checkov — K8s manifest scanning
         id: checkov
