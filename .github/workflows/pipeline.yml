@@ -1,18 +1,3 @@
-# ============================================================
-# ML DevSecOps Pipeline
-# ============================================================
-# Full pipeline: Train → Validate → Scan → Build → Sign → Deploy
-#
-# Stages:
-#   1. 🧠 ML: Train model + run validation gate
-#   2. 🔐 Security: Secret scanning + SAST + IaC scanning
-#   3. 🐳 Platform: Build Docker image
-#   4. 🔍 Security: Trivy vulnerability scan (fail on CRITICAL)
-#   5. ✍️  Security: Sign image with Cosign
-#   6. 🚀 Platform: Deploy to Kubernetes
-#   7. 📊 Platform: Smoke test deployed service
-# ============================================================
-
 name: ML DevSecOps Pipeline
 
 on:
@@ -286,6 +271,7 @@ jobs:
 
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master
+        if: needs.build-image.outputs.image-tag != ''
         with:
           image-ref: ${{ needs.build-image.outputs.image-tag }}
           format: sarif
