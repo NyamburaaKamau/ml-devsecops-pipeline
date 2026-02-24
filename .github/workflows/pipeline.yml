@@ -343,6 +343,7 @@ jobs:
   # ============================================================
   deploy:
     name: 🚀 Deploy to Kubernetes
+    if: false  # TODO: add KUBECONFIG secret when cluster is ready
     runs-on: ubuntu-latest
     needs: build-image
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
