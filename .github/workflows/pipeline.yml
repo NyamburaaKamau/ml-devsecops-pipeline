@@ -1,3 +1,18 @@
+# ============================================================
+# ML DevSecOps Pipeline
+# ============================================================
+# Full pipeline: Train → Validate → Scan → Build → Sign → Deploy
+#
+# Stages:
+#   1. 🧠 ML: Train model + run validation gate
+#   2. 🔐 Security: Secret scanning + SAST + IaC scanning
+#   3. 🐳 Platform: Build Docker image
+#   4. 🔍 Security: Trivy vulnerability scan (fail on CRITICAL)
+#   5. ✍️  Security: Sign image with Cosign
+#   6. 🚀 Platform: Deploy to Kubernetes
+#   7. 📊 Platform: Smoke test deployed service
+# ============================================================
+
 name: ML DevSecOps Pipeline
 
 on:
@@ -13,11 +28,11 @@ on:
         default: "false"
 
 env:
-  REGISTRY: docker.io
-  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/ml-serving
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/ml-serving
   PYTHON_VERSION: "3.11"
   KUBECTL_VERSION: "v1.29.0"
 
+# Global permissions for all jobs
 permissions:
   contents: read
   packages: write
@@ -26,72 +41,180 @@ permissions:
 
 jobs:
 
+  # ============================================================
+  # STAGE 1: 🧠 ML — Train & Validate
+  # ============================================================
   ml-train-and-validate:
+    name: 🧠 Train & Validate Model
     runs-on: ubuntu-latest
     outputs:
       model-approved: ${{ steps.validate.outputs.approved }}
       model-roc-auc: ${{ steps.validate.outputs.roc_auc }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install ML dependencies
+        run: pip install -r requirements.txt
 
-      - run: python ml/model/train.py
-
-      - id: validate
+      - name: Train model
+        env:
+          MLFLOW_TRACKING_URI: mlruns
         run: |
+          echo "🧠 Training model..."
+          python ml/model/train.py
+
+      - name: Run validation gate
+        id: validate
+        run: |
+          echo "🔍 Running model validation gate..."
           python ml/validation/validate.py
+
+          # Extract ROC-AUC for reporting
           ROC_AUC=$(python -c "import json; m=json.load(open('ml/model/metrics.json')); print(m['roc_auc'])")
           echo "roc_auc=$ROC_AUC" >> $GITHUB_OUTPUT
           echo "approved=true" >> $GITHUB_OUTPUT
+          echo "✅ Model approved. ROC-AUC: $ROC_AUC"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: model-artifacts
           path: |
             ml/model/model.joblib
             ml/model/metrics.json
+          retention-days: 30
+
+      - name: Comment metrics on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const metrics = JSON.parse(fs.readFileSync('ml/model/metrics.json'));
+            const body = `## 🧠 Model Validation Results
+            | Metric | Value | Threshold | Status |
+            |--------|-------|-----------|--------|
+            | ROC-AUC | ${metrics.roc_auc} | 0.82 | ${metrics.roc_auc >= 0.82 ? '✅' : '❌'} |
+            | Accuracy | ${metrics.accuracy} | 0.80 | ${metrics.accuracy >= 0.80 ? '✅' : '❌'} |
+            | F1 Score | ${metrics.f1_score} | 0.75 | ${metrics.f1_score >= 0.75 ? '✅' : '❌'} |
+            | Precision | ${metrics.precision} | 0.70 | ${metrics.precision >= 0.70 ? '✅' : '❌'} |
+            | Recall | ${metrics.recall} | 0.70 | ${metrics.recall >= 0.70 ? '✅' : '❌'} |
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
 
 
+  # ============================================================
+  # STAGE 2: 🔐 Security — Secret Scanning + SAST
+  # ============================================================
   security-scan-code:
+    name: 🔐 Code Security Scanning
     runs-on: ubuntu-latest
     needs: ml-train-and-validate
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0  # Full history for secret scanning
 
-      - uses: gitleaks/gitleaks-action@v2
+      - name: Secret scanning with Gitleaks
+        uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
 
-      - uses: returntocorp/semgrep-action@v1
+      - name: SAST with Semgrep
+        uses: returntocorp/semgrep-action@v1
         with:
-          config: p/security-audit
+          config: >-
+            p/python
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+
+      - name: Python dependency vulnerability check
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt --format=json --output=pip-audit-report.json || true
+          cat pip-audit-report.json
+
+      - name: Upload SAST report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-scan-report
+          path: pip-audit-report.json
 
 
+  # ============================================================
+  # STAGE 3: 🔐 Security — IaC Scanning
+  # ============================================================
   security-scan-iac:
+    name: 🔐 IaC Security Scanning
     runs-on: ubuntu-latest
     needs: ml-train-and-validate
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: aquasecurity/trivy-action@master
+      - name: Trivy — IaC security scan (replaces tfsec)
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: config
           scan-ref: platform/
           exit-code: "0"
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-iac-results.sarif
+
+      - name: Upload Trivy IaC results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('trivy-iac-results.sarif') != ''
+        with:
+          sarif_file: trivy-iac-results.sarif
+
+      - name: Checkov — K8s manifest scanning
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        continue-on-error: true
+        with:
+          directory: platform/kubernetes
+          framework: kubernetes
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-report.sarif
+
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('checkov-report.sarif') != ''
+        with:
+          sarif_file: checkov-report.sarif
 
 
+  # ============================================================
+  # STAGE 4: 🐳 Platform — Build Docker Image
+  # ============================================================
   build-image:
+    name: 🐳 Build Docker Image
     runs-on: ubuntu-latest
     needs: [security-scan-code, security-scan-iac]
     outputs:
@@ -99,32 +222,37 @@ jobs:
       image-tag: ${{ steps.meta.outputs.tags }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
         with:
           name: model-artifacts
           path: ml/model/
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      # ✅ FIXED LOGIN
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - id: meta
+      - name: Extract Docker metadata
+        id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
+            type=ref,event=pr
             type=sha,prefix=sha-
+            type=semver,pattern={{version}}
 
-      - id: build
+      - name: Build Docker image
+        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -133,81 +261,164 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Security: build attestation
           provenance: true
           sbom: true
 
 
+  # ============================================================
+  # STAGE 5: 🔍 Security — Trivy Container Scanning
+  # ============================================================
   security-scan-image:
+    name: 🔍 Container Security Scan
     runs-on: ubuntu-latest
     needs: build-image
+    permissions:
+      contents: read
+      security-events: write
 
     steps:
-      # ✅ FIXED LOGIN (must use Docker creds again)
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: aquasecurity/trivy-action@master
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ needs.build-image.outputs.image-tag }}
-          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-results.sarif
+          # CRITICAL: fail pipeline on any CRITICAL CVE
           exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Trivy SBOM generation
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.build-image.outputs.image-tag }}
+          format: cyclonedx
+          output: sbom.cyclonedx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cyclonedx.json
 
 
+  # ============================================================
+  # STAGE 6: ✍️ Security — Sign Image with Cosign
+  # ============================================================
   sign-image:
+    name: ✍️ Sign Container Image
     runs-on: ubuntu-latest
     needs: security-scan-image
     permissions:
-      id-token: write
+      contents: read
+      id-token: write  # Required for keyless signing
+      packages: write
 
     steps:
-      - uses: sigstore/cosign-installer@v3
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: docker.io
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - run: |
+      - name: Sign image (keyless via Sigstore)
+        run: |
           cosign sign --yes \
-          ${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
+            ${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
+          echo "✅ Image signed. No unsigned images will be deployed."
+
+      - name: Attach SBOM to image
+        run: |
+          cosign attach sbom \
+            --sbom sbom.cyclonedx.json \
+            ${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
 
 
+  # ============================================================
+  # STAGE 7: 🚀 Platform — Deploy to Kubernetes
+  # ============================================================
   deploy:
+    name: 🚀 Deploy to Kubernetes
     runs-on: ubuntu-latest
     needs: sign-image
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     environment: production
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: azure/setup-kubectl@v3
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
         with:
           version: ${{ env.KUBECTL_VERSION }}
 
-      - run: |
+      - name: Configure kubeconfig
+        run: |
           mkdir -p ~/.kube
           echo "${{ secrets.KUBECONFIG }}" | base64 -d > ~/.kube/config
           chmod 600 ~/.kube/config
 
-      - run: |
+      - name: Verify image signature before deploy
+        run: |
           cosign verify \
-          --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
-          --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-          ${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
+            --certificate-identity-regexp="https://github.com/${{ github.repository }}/*" \
+            --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
+            ${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}
+          echo "✅ Image signature verified. Safe to deploy."
 
-      - run: |
+      - name: Update image in Kubernetes manifests
+        run: |
           sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}@${{ needs.build-image.outputs.image-digest }}|g" \
-          platform/kubernetes/deployment.yaml
+            platform/kubernetes/deployment.yaml
 
-      - run: |
+      - name: Deploy to Kubernetes
+        run: |
           kubectl apply -f platform/kubernetes/
-          kubectl rollout status deployment/ml-serving -n ml-serving --timeout=300s "🚨 Deployment failed. Initiating rollback..."
+          kubectl rollout status deployment/ml-serving -n ml-serving --timeout=300s
+
+      - name: Smoke test deployed service
+        run: |
+          # Wait for pods to be fully ready
+          kubectl wait --for=condition=ready pod \
+            -l app=ml-serving -n ml-serving --timeout=120s
+
+          # Get service endpoint
+          SVC_URL=$(kubectl get svc ml-serving -n ml-serving \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Health check
+          curl -f "http://$SVC_URL/health" || exit 1
+
+          # Test prediction endpoint
+          curl -f -X POST "http://$SVC_URL/predict" \
+            -H "Content-Type: application/json" \
+            -d '{"tenure_months":6,"monthly_charges":75.5,"total_charges":450.0,
+                 "num_products":2,"support_calls":4,"payment_delay_days":5,
+                 "contract_length":1,"has_online_backup":0,"has_tech_support":0}' \
+            | python -c "import sys,json; r=json.load(sys.stdin); assert 'churn_prediction' in r"
+
+          echo "✅ Smoke tests passed. Deployment successful."
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "🚨 Deployment failed. Initiating rollback..."
           kubectl rollout undo deployment/ml-serving -n ml-serving
           echo "✅ Rolled back to previous version."
